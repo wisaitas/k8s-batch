@@ -1,0 +1,36 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: batch-job-cronjob
+spec:
+  schedule: "0 * * * *"  # รันทุก 1 ชั่วโมง (แทน 5 นาที)
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+          - name: batch-job
+            image: batch-job:latest  # แก้จาก batch-job:local
+            imagePullPolicy: Never
+            command: ["./job-publisher"]  # เพิ่ม command
+            env:  # เพิ่ม env variables
+            - name: DB_HOST
+              value: "host.docker.internal"
+            - name: DB_USER
+              value: "postgres"
+            - name: DB_PASSWORD
+              value: "postgres"
+            - name: DB_NAME
+              value: "postgres"
+            - name: REDIS_ADDR
+              value: "redis-service:6379"
+            resources:
+              requests:
+                memory: "128Mi"  # เพิ่ม memory
+                cpu: "100m"
+              limits:
+                memory: "256Mi"
+                cpu: "200m"
+          restartPolicy: OnFailure
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 1
