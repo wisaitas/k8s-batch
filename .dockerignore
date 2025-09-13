@@ -1,0 +1,47 @@
+# Ignore data files (seed files)
+data/
+*.csv
+
+# Ignore development files
+.git/
+.gitignore
+README.md
+docker-compose.yml
+*.md
+
+# Ignore IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Ignore OS files
+.DS_Store
+Thumbs.db
+
+# Ignore temp files
+tmp/
+temp/
+*.tmp
+*.log
+
+# Ignore build artifacts
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Ignore test files
+*_test.go
+test/
+tests/
+
+# Keep only necessary files for Docker build
+!go.mod
+!go.sum
+!batch/
+!k8s/
+!main.go
+!Dockerfile
+!Makefile
