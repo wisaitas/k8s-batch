@@ -1,0 +1,29 @@
+*** get network ***
+docker network ls
+
+*** create network ***
+docker network create -d bridge appnet
+
+*** delete network ***
+docker network rm appnet
+
+*** get kube service ***
+kubectl get apiservice
+
+*** delete kube service ***
+kubectl delete apiservice v1beta1.external.metrics.k8s.io
+
+*** get current namespace ***
+kubectl config current-context
+
+*** change current namespace *** 
+kubectl config set-context --current --namespace=<ns-name>
+
+*** get helm repo ***
+helm repo list
+
+*** install something helm ***
+helm repo add <name_alias> https://kedacore.github.io/charts
+
+*** update repo in helm ***
+helm repo update

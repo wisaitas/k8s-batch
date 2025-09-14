@@ -1,36 +1,91 @@
 apiVersion: batch/v1
 kind: CronJob
 metadata:
-  name: batch-job-cronjob
+  name: batch-scheduler
+  namespace: default
 spec:
-  schedule: "0 * * * *"  # รันทุก 1 ชั่วโมง (แทน 5 นาที)
+  # Run every 5 minutes to prepare batch jobs
+  schedule: "*/5 * * * *"
+  timeZone: "Asia/Bangkok"
+  
   jobTemplate:
     spec:
       template:
+        metadata:
+          labels:
+            app: batch-scheduler
         spec:
+          restartPolicy: Never
           containers:
-          - name: batch-job
-            image: batch-job:latest  # แก้จาก batch-job:local
-            imagePullPolicy: Never
-            command: ["./job-publisher"]  # เพิ่ม command
-            env:  # เพิ่ม env variables
-            - name: DB_HOST
-              value: "host.docker.internal"
-            - name: DB_USER
-              value: "postgres"
-            - name: DB_PASSWORD
-              value: "postgres"
-            - name: DB_NAME
-              value: "postgres"
-            - name: REDIS_ADDR
-              value: "redis-service:6379"
+          - name: scheduler
+            image: batch-scheduler:latest
+            imagePullPolicy: IfNotPresent
+            
+            command: ["/app/scheduler", "create-batch"]
+            
+            env:
+              - name: DB_DSN
+                valueFrom:
+                  secretKeyRef:
+                    name: db-secret
+                    key: DB_DSN
+              
+              # Scaling configuration
+              - name: RECORDS_PER_POD
+                value: "1000000"        # 1M records per pod
+              - name: MAX_PODS
+                value: "50"
+              - name: MIN_PODS
+                value: "1"
+              - name: PROCESSING_TIMEOUT_HOURS
+                value: "6"
+            
             resources:
               requests:
-                memory: "128Mi"  # เพิ่ม memory
+                memory: "256Mi"
                 cpu: "100m"
               limits:
-                memory: "256Mi"
+                memory: "512Mi"
                 cpu: "200m"
-          restartPolicy: OnFailure
-  successfulJobsHistoryLimit: 3
-  failedJobsHistoryLimit: 1
+
+---
+# Cleanup job - runs every hour to handle stale processing records
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: batch-cleanup
+  namespace: default
+spec:
+  schedule: "0 * * * *"  # Every hour
+  
+  jobTemplate:
+    spec:
+      template:
+        metadata:
+          labels:
+            app: batch-cleanup
+        spec:
+          restartPolicy: Never
+          containers:
+          - name: cleanup
+            image: batch-scheduler:latest
+            imagePullPolicy: IfNotPresent
+            
+            command: ["/app/scheduler", "cleanup"]
+            
+            env:
+              - name: DB_DSN
+                valueFrom:
+                  secretKeyRef:
+                    name: db-secret
+                    key: DB_DSN
+              - name: PROCESSING_TIMEOUT_HOURS
+                value: "6"
+            
+            resources:
+              requests:
+                memory: "128Mi"
+                cpu: "50m"
+              limits:
+                memory: "256Mi"
+                cpu: "100m"

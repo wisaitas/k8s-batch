@@ -1,0 +1,43 @@
+ตอนนี้อยากทำ batch ที่ตื่นตามเวลาที่กำหนดโดยใช้ k8s และอยากให้มันรู้จำนวน data ก่อนเช่นถ้า table ที่กำลังจะจัดการหรือ data ทั้งหมดที่จะจัดการมันเยอะตามนี้ จะทำให้เวลารัน batch จะ scaling ตาม task ที่ต้องจัดการทำไงดี เช่น data 100,000,000 อ่ะ เราอาจสเกล pod มา 10 ตัวจัดการคนละ 10 ล้าน ถ้าหาก data 1 ล้านงี้pod ก็ตัวเดียว ทำไงดี ใช้ tool ได้หมดเลยที่มาจัดการ พร้อม k8s ได้หมด + code ต้องเขียนไง 
+อ่ะ นี้ model ตอนนี้
+package src
+
+import (
+	"database/sql"
+	"time"
+)
+
+type User struct {
+	ID          int       `json:"id" gorm:"column:id;primaryKey"`
+	Name        string    `json:"name" gorm:"column:name"`
+	Email       string    `json:"email" gorm:"column:email;uniqueIndex"`
+	Age         int       `json:"age" gorm:"column:age"`
+	Salary      int       `json:"salary" gorm:"column:salary"`
+	CreatedAt   time.Time `json:"created_at" gorm:"column:created_at"`
+	BatchStatus string    `json:"batch_status" gorm:"column:batch_status"`
+	BatchID     int       `json:"batch_id" gorm:"column:batch_id"`
+	UpdatedAt   time.Time `json:"updated_at" gorm:"column:updated_at"`
+}
+
+type BatchJob struct {
+	ID               int            `json:"id" gorm:"column:id;primaryKey"`
+	BatchName        string         `json:"batch_name" gorm:"column:batch_name"`
+	Status           string         `json:"status" gorm:"column:status"`
+	TotalRecords     int            `json:"total_records" gorm:"column:total_records"`
+	ProcessedRecords int            `json:"processed_records" gorm:"column:processed_records"`
+	FailedRecords    int            `json:"failed_records" gorm:"column:failed_records"`
+	StartedAt        time.Time      `json:"started_at" gorm:"column:started_at"`
+	CompletedAt      sql.NullTime   `json:"completed_at" gorm:"column:completed_at"`
+	ErrorMessage     sql.NullString `json:"error_message" gorm:"column:error_message"`
+}
+
+func (User) TableName() string {
+	return "users"
+}
+
+func (BatchJob) TableName() string {
+	return "batch_jobs"
+}
+
+statuses: []string{"pending", "processing", "completed", "failed", "cancelled"},
+โดยตอนนี้ model user มี data เตรียมไปละ 100,000,000 data พร้อมที่จะให้ไป process ละ ทำ logic ง่ายๆ ไปทำให้ status ที่เป็น pending , failed ให้กลายเป็น completed ถ้า ตัวไหนโดน batch ทำงานอยู่ให้เป็น processing ตัว scale อื่นจะได้ไม่หยิบซ้ำอ่ะทำไงดี

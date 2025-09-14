@@ -1,52 +1,53 @@
-.PHONY: build deploy-redis deploy-publisher deploy-workers scale-up scale-down clean
+.PHONY: seed-schema seed-generate seed-import seed-all build-images deploy-k8s install-keda clean-k8s clean-keda
 
-# Build Docker image
-build:
-	docker build -t batch-job:latest -f batch/Dockerfile .
+# Database seeding commands
+seed-schema:
+	go run src/seed/seed.go schema
 
-# Deploy Redis
-deploy-redis:
-	kubectl apply -f k8s/redis/deployment.yml
+seed-generate:
+	go run src/seed/seed.go generate
 
-# Deploy job publisher
-deploy-publisher:
-	kubectl apply -f k8s/batch/publisher-job.yml
+seed-import:
+	go run src/seed/seed.go import
 
-# Deploy workers with HPA
-deploy-workers:
-	kubectl apply -f k8s/batch/worker-deployment.yml
-	kubectl apply -f k8s/batch/hpa.yml
+seed-all:
+	go run src/seed/seed.go all
 
-# Scale up workers manually (if needed)
-scale-up:
-	kubectl scale deployment batch-worker --replicas=20
+build-images:
+	docker build -t batch-processor:latest .
+	docker build -t batch-scheduler:latest .
 
-# Scale down workers
-scale-down:
-	kubectl scale deployment batch-worker --replicas=2
+install-keda:
+	helm install keda kedacore/keda --namespace keda --create-namespace
 
-# Monitor queue length
-monitor-queue:
-	kubectl exec -it deployment/redis -- redis-cli llen processing_jobs
+clean-keda:
+	kubectl delete scaledjobs --all
+	kubectl delete scaledobjects --all
+	kubectl delete crd cloudeventsources.eventing.keda.sh
+	kubectl delete crd scaledjobs.keda.sh
+	kubectl delete crd scaledobjects.keda.sh
+	kubectl delete crd triggerauthentications.keda.sh
+	kubectl delete crd clustertriggerauthentications.keda.sh
+	kubectl delete namespace keda --ignore-not-found=true
+	kubectl delete validatingwebhookconfiguration keda-admission --ignore-not-found=true
+	kubectl delete mutatingwebhookconfiguration keda-admission --ignore-not-found=true
+	kubectl delete clusterrole keda-operator --ignore-not-found=true
+	kubectl delete clusterrolebinding keda-operator --ignore-not-found=true
+	kubectl delete apiservice v1beta1.external.metrics.k8s.io --ignore-not-found=true
+	kubectl get crd | grep keda | awk '{print $1}' | xargs -r kubectl delete crd
+	kubectl delete namespace keda --ignore-not-found=true
 
-# Monitor worker status
-monitor-workers:
-	kubectl get pods -l app=batch-worker
-	kubectl top pods -l app=batch-worker
+test-local:
+	docker-compose up -d postgres
+	docker-compose --profile tools run --rm batch-scheduler
+	docker-compose up batch-worker
 
-# Clean up
-clean:
-	kubectl delete -f k8s/batch/ --ignore-not-found
-	kubectl delete -f k8s/redis/ --ignore-not-found
+deploy-k8s:
+	kubectl apply -f k8s/secret.yml
+	kubectl apply -f k8s/scalejob.yml
+	kubectl apply -f k8s/cronjob.yml
 
-# Full deployment
-deploy-all: build deploy-redis deploy-workers deploy-publisher
-
-# Check job progress
-check-progress:
-	@echo "Queue length:"
-	@kubectl exec -it deployment/redis -- redis-cli llen processing_jobs
-	@echo "\nWorker pods:"
-	@kubectl get pods -l app=batch-worker
-	@echo "\nHPA status:"
-	@kubectl get hpa batch-worker-hpa
+clean-k8s:
+	kubectl delete -f k8s/secret.yml
+	kubectl delete -f k8s/scalejob.yml
+	kubectl delete -f k8s/cronjob.yml
