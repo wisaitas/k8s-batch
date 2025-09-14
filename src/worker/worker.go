@@ -2,9 +2,10 @@ package main
 
 import (
 	"context"
-	"database/sql"
+	"errors"
 	"fmt"
 	"log"
+	"log/slog"
 	"os"
 	"os/signal"
 	"strconv"
@@ -18,137 +19,147 @@ import (
 	"gorm.io/gorm/logger"
 )
 
-const (
-	StatusPending    = "pending"
-	StatusProcessing = "processing"
-	StatusCompleted  = "completed"
-	StatusFailed     = "failed"
-)
+// =========================
+// Config
+// =========================
 
-type Worker struct {
-	db              *gorm.DB
-	claimLimit      int
-	sleepMS         int
-	leaseSeconds    int
-	batchID         sql.NullInt64
-	workerID        string
-	processingLimit int // Maximum records to process before stopping
+type Config struct {
+	PGDsn         string
+	ClaimSize     int
+	Workers       int
+	ClaimTimeout  time.Duration
+	ShutdownGrace time.Duration
+	PodName       string
 }
 
-func NewWorker(db *gorm.DB) *Worker {
-	claimLimit, _ := strconv.Atoi(getEnv("CLAIM_LIMIT", "5000"))
-	sleepMS, _ := strconv.Atoi(getEnv("EMPTY_SLEEP_MS", "1500"))
-	leaseSeconds, _ := strconv.Atoi(getEnv("LEASE_SECONDS", "600"))
-	processingLimit, _ := strconv.Atoi(getEnv("PROCESSING_LIMIT", "0")) // 0 = unlimited
-
-	var batchID sql.NullInt64
-	if batchIDStr := getEnv("BATCH_ID", ""); batchIDStr != "" {
-		if v, err := strconv.ParseInt(batchIDStr, 10, 64); err == nil {
-			batchID = sql.NullInt64{Int64: v, Valid: true}
-		}
+func getEnv(k, def string) string {
+	if v := os.Getenv(k); v != "" {
+		return v
 	}
-
-	hostname, _ := os.Hostname()
-	workerID := fmt.Sprintf("%s-%d", hostname, os.Getpid())
-
-	return &Worker{
-		db:              db,
-		claimLimit:      claimLimit,
-		sleepMS:         sleepMS,
-		leaseSeconds:    leaseSeconds,
-		batchID:         batchID,
-		workerID:        workerID,
-		processingLimit: processingLimit,
-	}
+	return def
 }
 
-func (w *Worker) Run(ctx context.Context) error {
-	log.Printf("Worker %s starting with claim_limit=%d, lease_seconds=%d",
-		w.workerID, w.claimLimit, w.leaseSeconds)
+func mustAtoi(name, v string) int {
+	i, err := strconv.Atoi(v)
+	if err != nil {
+		log.Fatalf("env %s must be int: %v", name, err)
+	}
+	return i
+}
 
-	totalProcessed := 0
+func mustParseDur(name, v string) time.Duration {
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		log.Fatalf("env %s must be duration: %v", name, err)
+	}
+	return d
+}
 
-	for {
-		select {
-		case <-ctx.Done():
-			log.Printf("Worker %s shutting down gracefully. Processed %d records total",
-				w.workerID, totalProcessed)
-			return nil
-		default:
-		}
-
-		// Check processing limit
-		if w.processingLimit > 0 && totalProcessed >= w.processingLimit {
-			log.Printf("Worker %s reached processing limit of %d records",
-				w.workerID, w.processingLimit)
-			return nil
-		}
-
-		// Claim work
-		ids, err := w.claimWork(ctx)
-		if err != nil {
-			log.Printf("Worker %s failed to claim work: %v", w.workerID, err)
-			time.Sleep(time.Duration(w.sleepMS) * time.Millisecond)
-			continue
-		}
-
-		if len(ids) == 0 {
-			log.Printf("Worker %s: no work available, sleeping...", w.workerID)
-			time.Sleep(time.Duration(w.sleepMS) * time.Millisecond)
-			continue
-		}
-
-		log.Printf("Worker %s claimed %d records for processing", w.workerID, len(ids))
-
-		// Process the work
-		processed, failed := w.processWork(ctx, ids)
-		totalProcessed += processed + failed
-
-		log.Printf("Worker %s processed %d records (%d success, %d failed). Total: %d",
-			w.workerID, len(ids), processed, failed, totalProcessed)
-
-		// Cleanup stale processing records periodically
-		if totalProcessed%10000 == 0 {
-			if err := w.cleanupStaleWork(ctx); err != nil {
-				log.Printf("Worker %s failed to cleanup stale work: %v", w.workerID, err)
-			}
-		}
+func loadConfig() Config {
+	return Config{
+		PGDsn:         getEnv("PG_DSN", "postgres://user:pass@postgres:5432/app?sslmode=disable"),
+		ClaimSize:     mustAtoi("CLAIM_SIZE", getEnv("CLAIM_SIZE", "20000")),
+		Workers:       mustAtoi("WORKERS", getEnv("WORKERS", "8")),
+		ClaimTimeout:  mustParseDur("CLAIM_TIMEOUT_S", getEnv("CLAIM_TIMEOUT_S", "30s")),
+		ShutdownGrace: mustParseDur("SHUTDOWN_GRACE_S", getEnv("SHUTDOWN_GRACE_S", "30s")),
+		PodName:       getEnv("POD_NAME", fmt.Sprintf("worker-%d", time.Now().Unix())),
 	}
 }
 
-func (w *Worker) claimWork(ctx context.Context) ([]int, error) {
-	tx := w.db.WithContext(ctx).Begin()
-	if tx.Error != nil {
-		return nil, tx.Error
+// =========================
+// DB
+// =========================
+
+type DB struct {
+	*gorm.DB
+}
+
+func newDB(ctx context.Context, dsn string) (*DB, error) {
+	gormLogger := logger.New(
+		log.New(os.Stdout, "\r\n", log.LstdFlags),
+		logger.Config{
+			SlowThreshold:             200 * time.Millisecond,
+			LogLevel:                  logger.Warn,
+			IgnoreRecordNotFoundError: true,
+		},
+	)
+
+	db, err := gorm.Open(postgres.Open(dsn), &gorm.Config{
+		Logger: gormLogger,
+	})
+	if err != nil {
+		return nil, err
 	}
-	defer tx.Rollback()
 
-	// Build query based on whether we have a specific batch_id
-	var query string
-	var args []interface{}
+	// Configure connection pool
+	sqlDB, err := db.DB()
+	if err != nil {
+		return nil, err
+	}
+	sqlDB.SetMaxOpenConns(16)
+	sqlDB.SetMaxIdleConns(4)
+	sqlDB.SetConnMaxLifetime(time.Hour)
 
-	if w.batchID.Valid {
-		query = `
-		WITH cte AS (
-			SELECT id
-			FROM users
-			WHERE batch_status IN ('pending', 'failed') 
-			AND (batch_id = ? OR batch_id IS NULL)
-			ORDER BY id
-			FOR UPDATE SKIP LOCKED
-			LIMIT ?
-		)
-		UPDATE users u
-		SET batch_status = 'processing',
-			updated_at = NOW(),
-			batch_id = ?
-		FROM cte
-		WHERE u.id = cte.id
-		RETURNING u.id;`
-		args = []interface{}{w.batchID.Int64, w.claimLimit, w.batchID.Int64}
-	} else {
-		query = `
-		WITH cte AS (
+	return &DB{db}, nil
+}
+
+// =========================
+// Batch Job Management
+// =========================
+
+func (db *DB) createBatchJob(ctx context.Context, batchName string) (*model.BatchJob, error) {
+	batch := &model.BatchJob{
+		BatchName:        batchName,
+		Status:           "running",
+		TotalRecords:     0,
+		ProcessedRecords: 0,
+		FailedRecords:    0,
+		StartedAt:        time.Now(),
+	}
+
+	err := db.WithContext(ctx).Create(batch).Error
+	if err != nil {
+		return nil, err
+	}
+
+	slog.Info("created batch job", "batch_id", batch.ID, "batch_name", batch.BatchName)
+	return batch, nil
+}
+
+func (db *DB) updateBatchJobProgress(ctx context.Context, batchID int, processed, failed int) error {
+	return db.WithContext(ctx).Model(&model.BatchJob{}).
+		Where("id = ?", batchID).
+		Updates(map[string]interface{}{
+			"processed_records": gorm.Expr("processed_records + ?", processed),
+			"failed_records":    gorm.Expr("failed_records + ?", failed),
+		}).Error
+}
+
+func (db *DB) completeBatchJob(ctx context.Context, batchID int, status string, errorMsg *string) error {
+	updates := map[string]interface{}{
+		"status":       status,
+		"completed_at": time.Now(),
+	}
+
+	if errorMsg != nil {
+		updates["error_message"] = *errorMsg
+	}
+
+	return db.WithContext(ctx).Model(&model.BatchJob{}).
+		Where("id = ?", batchID).
+		Updates(updates).Error
+}
+
+// =========================
+// User Processing
+// =========================
+
+func (db *DB) claimIDs(ctx context.Context, batchID int, claimSize int) ([]int64, error) {
+	var users []model.User
+
+	// Use raw SQL for atomic claim operation with SKIP LOCKED
+	err := db.WithContext(ctx).Raw(`
+		WITH picked AS (
 			SELECT id
 			FROM users
 			WHERE batch_status IN ('pending', 'failed')
@@ -158,144 +169,244 @@ func (w *Worker) claimWork(ctx context.Context) ([]int, error) {
 		)
 		UPDATE users u
 		SET batch_status = 'processing',
+			batch_id = ?,
 			updated_at = NOW()
-		FROM cte
-		WHERE u.id = cte.id
-		RETURNING u.id;`
-		args = []interface{}{w.claimLimit}
-	}
+		FROM picked
+		WHERE u.id = picked.id
+		RETURNING u.id
+	`, claimSize, batchID).Scan(&users).Error
 
-	rows, err := tx.Raw(query, args...).Rows()
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 
-	var ids []int
-	for rows.Next() {
-		var id int
-		if err := rows.Scan(&id); err != nil {
-			return nil, err
-		}
-		ids = append(ids, id)
+	ids := make([]int64, len(users))
+	for i, user := range users {
+		ids[i] = int64(user.ID)
 	}
-
-	if err := tx.Commit().Error; err != nil {
-		return nil, err
-	}
-
 	return ids, nil
 }
 
-func (w *Worker) processWork(ctx context.Context, ids []int) (processed, failed int) {
+func (db *DB) markCompleted(ctx context.Context, batchID int, ids []int64) error {
 	if len(ids) == 0 {
-		return 0, 0
+		return nil
 	}
 
-	// Simulate processing work
-	// In real implementation, you would:
-	// 1. Fetch the records
-	// 2. Apply business logic
-	// 3. Call external APIs
-	// 4. Transform data
-	// 5. Update status based on success/failure
-
-	batchSize := 1000
-	for i := 0; i < len(ids); i += batchSize {
-		end := i + batchSize
-		if end > len(ids) {
-			end = len(ids)
-		}
-
-		batch := ids[i:end]
-
-		// Simulate work with some processing time
-		processingTime := time.Duration(len(batch)) * time.Millisecond * 5 // 5ms per record
-		time.Sleep(processingTime)
-
-		// For this example, mark all as completed
-		// In real world, you might have some failures
-		err := w.db.WithContext(ctx).
-			Model(&model.User{}).
-			Where("id IN ?", batch).
-			Updates(map[string]interface{}{
-				"batch_status": StatusCompleted,
-				"updated_at":   time.Now(),
-			}).Error
-
-		if err != nil {
-			log.Printf("Worker %s failed to update batch %v: %v", w.workerID, batch, err)
-			// Mark as failed
-			w.db.WithContext(ctx).
-				Model(&model.User{}).
-				Where("id IN ?", batch).
-				Updates(map[string]interface{}{
-					"batch_status": StatusFailed,
-					"updated_at":   time.Now(),
-				})
-			failed += len(batch)
-		} else {
-			processed += len(batch)
-		}
-	}
-
-	return processed, failed
-}
-
-func (w *Worker) cleanupStaleWork(ctx context.Context) error {
-	leaseTimeout := time.Now().Add(-time.Duration(w.leaseSeconds) * time.Second)
-
-	result := w.db.WithContext(ctx).
-		Model(&model.User{}).
-		Where("batch_status = ? AND updated_at < ?", StatusProcessing, leaseTimeout).
+	result := db.WithContext(ctx).Model(&model.User{}).
+		Where("id IN ? AND batch_id = ?", ids, batchID).
 		Updates(map[string]interface{}{
-			"batch_status": StatusPending,
+			"batch_status": "completed",
 			"updated_at":   time.Now(),
 		})
 
-	if result.Error != nil {
-		return result.Error
+	return result.Error
+}
+
+type failItem struct {
+	ID    int64
+	Error string
+}
+
+func (db *DB) markFailed(ctx context.Context, batchID int, fails []failItem) error {
+	if len(fails) == 0 {
+		return nil
 	}
 
-	if result.RowsAffected > 0 {
-		log.Printf("Worker %s requeued %d stale processing records",
-			w.workerID, result.RowsAffected)
+	ids := make([]int64, len(fails))
+	for i, f := range fails {
+		ids[i] = f.ID
 	}
 
+	result := db.WithContext(ctx).Model(&model.User{}).
+		Where("id IN ? AND batch_id = ?", ids, batchID).
+		Updates(map[string]interface{}{
+			"batch_status": "failed",
+			"updated_at":   time.Now(),
+		})
+
+	return result.Error
+}
+
+// =========================
+// Processing
+// =========================
+
+type result struct {
+	id  int64
+	err error
+}
+
+func processOne(ctx context.Context) error {
+	// TODO: ใส่ลอจิกจริงของงานที่ต้องทำกับ record id นี้
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(2 * time.Millisecond):
+	}
+	// return errors.New("mock failure") // เปิดไว้ทดสอบเส้นทาง failed
 	return nil
 }
 
-func main() {
-	dsn := os.Getenv("DB_DSN")
-	if dsn == "" {
-		log.Fatal("DB_DSN environment variable is required")
-	}
-
-	// Configure GORM with custom logger
-	db, err := gorm.Open(postgres.Open(dsn), &gorm.Config{
-		Logger: logger.Default.LogMode(logger.Warn), // Only log warnings and errors
-	})
-	if err != nil {
-		log.Fatalf("Failed to connect to database: %v", err)
-	}
-
-	worker := NewWorker(db)
-
-	// Setup graceful shutdown
-	ctx, cancel := signal.NotifyContext(context.Background(),
-		syscall.SIGTERM, syscall.SIGINT)
+func runBatch(ctx context.Context, db *DB, cfg Config, batchJob *model.BatchJob) error {
+	claimCtx, cancel := context.WithTimeout(ctx, cfg.ClaimTimeout)
 	defer cancel()
 
-	if err := worker.Run(ctx); err != nil {
-		log.Fatalf("Worker failed: %v", err)
+	ids, err := db.claimIDs(claimCtx, batchJob.ID, cfg.ClaimSize)
+	if err != nil {
+		return fmt.Errorf("claim: %w", err)
+	}
+	if len(ids) == 0 {
+		slog.Info("no more pending rows; completing batch", "batch_id", batchJob.ID)
+		return db.completeBatchJob(ctx, batchJob.ID, "completed", nil)
+	}
+	slog.Info("claimed", "batch_id", batchJob.ID, "count", len(ids))
+
+	// Worker pool
+	tasks := make(chan int64, len(ids))
+	results := make(chan result, len(ids))
+
+	// spawn workers
+	workers := cfg.Workers
+	if workers <= 0 {
+		workers = 1
+	}
+	for i := 0; i < workers; i++ {
+		go func() {
+			for id := range tasks {
+				var lastErr error
+				for attempt := 1; attempt <= 3; attempt++ {
+					perItemCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+					lastErr = processOne(perItemCtx)
+					cancel()
+					if lastErr == nil {
+						break
+					}
+					time.Sleep(time.Duration(attempt) * 100 * time.Millisecond)
+				}
+				results <- result{id: id, err: lastErr}
+			}
+		}()
 	}
 
-	log.Println("Worker stopped")
+	for _, id := range ids {
+		tasks <- id
+	}
+	close(tasks)
+
+	var completed []int64
+	var fails []failItem
+
+	for i := 0; i < len(ids); i++ {
+		r := <-results
+		if r.err == nil {
+			completed = append(completed, r.id)
+		} else {
+			fails = append(fails, failItem{ID: r.id, Error: r.err.Error()})
+		}
+	}
+
+	// อัปเดตสถานะกลับ DB
+	if err := db.markCompleted(ctx, batchJob.ID, completed); err != nil {
+		return fmt.Errorf("markCompleted: %w", err)
+	}
+	if err := db.markFailed(ctx, batchJob.ID, fails); err != nil {
+		return fmt.Errorf("markFailed: %w", err)
+	}
+
+	// อัปเดต batch job progress
+	if err := db.updateBatchJobProgress(ctx, batchJob.ID, len(completed), len(fails)); err != nil {
+		return fmt.Errorf("updateBatchJobProgress: %w", err)
+	}
+
+	slog.Info("batch iteration done",
+		"batch_id", batchJob.ID,
+		"claimed", len(ids),
+		"completed", len(completed),
+		"failed", len(fails),
+	)
+	return nil
 }
 
-func getEnv(key, defaultValue string) string {
-	if value := os.Getenv(key); value != "" {
-		return value
+// =========================
+// Main
+// =========================
+
+func main() {
+	handler := slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})
+	slog.SetDefault(slog.New(handler))
+
+	cfg := loadConfig()
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	db, err := newDB(ctx, cfg.PGDsn)
+	if err != nil {
+		log.Fatalf("db connect: %v", err)
 	}
-	return defaultValue
+	defer func() {
+		sqlDB, _ := db.DB.DB()
+		if sqlDB != nil {
+			sqlDB.Close()
+		}
+	}()
+
+	// สร้าง batch job สำหรับ worker นี้
+	batchName := fmt.Sprintf("%s-%s", cfg.PodName, time.Now().Format("20060102-150405"))
+	batchJob, err := db.createBatchJob(ctx, batchName)
+	if err != nil {
+		log.Fatalf("create batch job: %v", err)
+	}
+
+	slog.Info("worker started", "pod_name", cfg.PodName, "batch_id", batchJob.ID, "batch_name", batchName)
+
+	var lastErr error
+	defer func() {
+		// Complete batch job เมื่อจบการทำงาน
+		status := "completed"
+		var errorMsg *string
+		if lastErr != nil {
+			status = "failed"
+			errStr := lastErr.Error()
+			errorMsg = &errStr
+		}
+
+		if err := db.completeBatchJob(context.Background(), batchJob.ID, status, errorMsg); err != nil {
+			slog.Error("failed to complete batch job", "err", err)
+		}
+		slog.Info("worker finished", "batch_id", batchJob.ID, "status", status)
+	}()
+
+	for {
+		select {
+		case <-ctx.Done():
+			slog.Warn("shutting down (signal)")
+			lastErr = errors.New("shutdown by signal")
+			grace(ctx, cfg.ShutdownGrace)
+			return
+		default:
+			if err := runBatch(ctx, db, cfg, batchJob); err != nil {
+				if errors.Is(err, context.Canceled) {
+					slog.Warn("context canceled")
+					lastErr = err
+					grace(ctx, cfg.ShutdownGrace)
+					return
+				}
+				slog.Error("runBatch error; backing off", "err", err, "batch_id", batchJob.ID)
+				lastErr = err
+				time.Sleep(2 * time.Second)
+			} else {
+				// ถ้า runBatch สำเร็จและไม่มี pending records แล้ว ให้จบการทำงาน
+				return
+			}
+		}
+	}
+}
+
+func grace(ctx context.Context, d time.Duration) {
+	slog.Info("grace period", "seconds", d.Seconds())
+	timer := time.NewTimer(d)
+	select {
+	case <-timer.C:
+	case <-ctx.Done():
+	}
 }

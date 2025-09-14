@@ -582,9 +582,9 @@ func main() {
 		// Generate CSV files
 		fmt.Println("Starting CSV generation...")
 		_, err := GenerateCSVData(
-			100_000_000, // 100M records
-			1_000_000,   // 1M per file
-			"data",      // output directory
+			50_000_000, // 100M records
+			1_000_000,  // 1M per file
+			"data",     // output directory
 		)
 		if err != nil {
 			log.Fatal("CSV generation failed:", err)

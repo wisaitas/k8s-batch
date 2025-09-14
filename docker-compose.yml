@@ -19,8 +19,8 @@ services:
 
 volumes:
   postgres_data:
-    external: true
-    name: ea8c84cbcfdaea7aa285df52f6b95309ebb5fab24048bb6f9122137d622729a9
+    # external: true
+    # name: ea8c84cbcfdaea7aa285df52f6b95309ebb5fab24048bb6f9122137d622729a9
 
 networks:
   k8s-practice-network:

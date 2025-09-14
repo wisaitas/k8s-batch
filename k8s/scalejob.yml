@@ -1,116 +1,45 @@
 apiVersion: keda.sh/v1alpha1
 kind: ScaledJob
 metadata:
-  name: batch-processor
-  namespace: default
+  name: users-batch
 spec:
-  # Polling interval for checking scaling metrics
   pollingInterval: 30
-  maxReplicaCount: 50         # Maximum number of concurrent jobs
-  successfulJobsHistoryLimit: 5
-  failedJobsHistoryLimit: 5
-  
-  # Scaling strategy - removed invalid "accurate" strategy
-  scalingStrategy:
-    multipleScalersCalculation: max  # Use the maximum value from all scalers
-  
-  jobTargetRef:
-    parallelism: 1            # One pod per job
-    completions: 1
-    backoffLimit: 3
-    activeDeadlineSeconds: 3600  # 1 hour timeout per job
-    template:
+  maxReplicaCount: 5
+  successfulJobsHistoryLimit: 2
+  failedJobsHistoryLimit: 2
+  triggers:
+    - type: postgresql
+      authenticationRef:
+        name: pgconn
       metadata:
-        labels:
-          app: batch-processor
+        query: "SELECT COUNT(1) FROM users WHERE batch_status IN ('pending','failed')"
+        # targetQueryValue: "10000000"   # backlog 10M ต่อ 1 replica
+        targetQueryValue: "20000"
+  jobTargetRef:
+    parallelism: 1
+    completions: 1
+    template:
       spec:
         restartPolicy: Never
         containers:
-          - name: batch-worker
-            image: batch-processor:latest
-            imagePullPolicy: IfNotPresent
-            
-            env:
-              - name: DB_DSN
-                valueFrom:
-                  secretKeyRef:
-                    name: db-secret
-                    key: DB_DSN
-              
-              # Batch processing configuration
-              - name: CLAIM_LIMIT
-                value: "10000"          # Records to claim per iteration
-              - name: PROCESSING_LIMIT
-                value: "1000000"        # Max records per pod before stopping
-              - name: LEASE_SECONDS
-                value: "1800"           # 30 minutes lease timeout
-              - name: EMPTY_SLEEP_MS
-                value: "5000"           # 5 seconds when no work
-              
-              # Optional: specific batch ID
-              # - name: BATCH_ID
-              #   value: "123"
-            
-            resources:
-              requests:
-                memory: "512Mi"
-                cpu: "250m"
-              limits:
-                memory: "1Gi"
-                cpu: "500m"
-            
-            # Health checks
-            livenessProbe:
-              exec:
-                command:
-                - /bin/sh
-                - -c
-                - "ps aux | grep -v grep | grep worker"
-              initialDelaySeconds: 30
-              periodSeconds: 30
-              timeoutSeconds: 5
-              failureThreshold: 3
-
-  triggers:
-    # Time-based scaling (only during batch processing hours)
-    - type: cron
-      metadata:
-        timezone: Asia/Bangkok
-        start: "0 2 * * *"      # Start at 2:00 AM
-        end: "0 8 * * *"        # End at 8:00 AM
-        desiredReplicas: "1"    # Minimum activation
-    
-    # Dynamic scaling based on pending work
-    - type: postgresql
-      metadata:
-        connectionFromEnv: DB_DSN
-        # Calculate required pods: CEIL(pending_records / records_per_pod)
-        # This query returns the number of jobs needed
-        query: |
-          SELECT 
-            CASE 
-              WHEN COUNT(*) = 0 THEN 0
-              ELSE GREATEST(1, LEAST(50, CEIL(COUNT(*)::numeric / 1000000)))
-            END as required_pods
-          FROM users 
-          WHERE batch_status IN ('pending', 'failed');
-        targetQueryValue: "1"
-    
-    # Additional trigger for burst processing
-    - type: postgresql
-      metadata:
-        connectionFromEnv: DB_DSN
-        # Scale up quickly if there are many records waiting
-        query: |
-          SELECT 
-            CASE 
-              WHEN COUNT(*) > 50000000 THEN 20  -- 50M+ records = 20 pods
-              WHEN COUNT(*) > 20000000 THEN 10  -- 20M+ records = 10 pods  
-              WHEN COUNT(*) > 5000000 THEN 5    -- 5M+ records = 5 pods
-              WHEN COUNT(*) > 1000000 THEN 2    -- 1M+ records = 2 pods
-              WHEN COUNT(*) > 0 THEN 1          -- Any records = 1 pod
-              ELSE 0                            -- No records = 0 pods
-            END as burst_pods
-          FROM users 
-          WHERE batch_status IN ('pending', 'failed');
-        targetQueryValue: "1"
+        - name: worker
+          image: batch-worker:latest
+          imagePullPolicy: Never
+          env:
+          - name: PG_DSN
+            value: "postgres://postgres:postgres@host.docker.internal:5432/postgres?sslmode=disable"
+          - name: CLAIM_SIZE
+            value: "20000"
+          - name: WORKERS
+            value: "8"
+          - name: POD_NAME
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.name
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "512Mi"  
+              cpu: "500m"

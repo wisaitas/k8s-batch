@@ -24,6 +24,10 @@ helm repo list
 
 *** install something helm ***
 helm repo add <name_alias> https://kedacore.github.io/charts
+ex. helm repo add kedacore https://kedacore.github.io/charts
 
 *** update repo in helm ***
 helm repo update
+
+*** delete helm repo ***
+helm repo remove <name>

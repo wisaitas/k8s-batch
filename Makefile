@@ -1,4 +1,4 @@
-.PHONY: seed-schema seed-generate seed-import seed-all build-images deploy-k8s install-keda clean-k8s clean-keda
+.PHONY: seed-schema seed-generate seed-import seed-all build-images install-keda clean-keda prepare-deploy deploy-k8s clean-k8s
 
 # Database seeding commands
 seed-schema:
@@ -12,10 +12,6 @@ seed-import:
 
 seed-all:
 	go run src/seed/seed.go all
-
-build-images:
-	docker build -t batch-processor:latest .
-	docker build -t batch-scheduler:latest .
 
 install-keda:
 	helm install keda kedacore/keda --namespace keda --create-namespace
@@ -37,17 +33,17 @@ clean-keda:
 	kubectl get crd | grep keda | awk '{print $1}' | xargs -r kubectl delete crd
 	kubectl delete namespace keda --ignore-not-found=true
 
-test-local:
-	docker-compose up -d postgres
-	docker-compose --profile tools run --rm batch-scheduler
-	docker-compose up batch-worker
+build-images:
+	docker build -t batch-worker:latest -f src/worker/Dockerfile .
+
+prepare-deploy:
+	kubectl apply -f k8s/pg-secret.yml
+	kubectl apply -f k8s/trigger-auth.yml
 
 deploy-k8s:
-	kubectl apply -f k8s/secret.yml
 	kubectl apply -f k8s/scalejob.yml
-	kubectl apply -f k8s/cronjob.yml
 
 clean-k8s:
-	kubectl delete -f k8s/secret.yml
-	kubectl delete -f k8s/scalejob.yml
-	kubectl delete -f k8s/cronjob.yml
+	kubectl delete scaledjobs users-batch --ignore-not-found=true
+	kubectl delete secret pg-secret --ignore-not-found=true
+	kubectl delete triggerauthentications pgconn --ignore-not-found=true
